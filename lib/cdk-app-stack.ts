@@ -39,7 +39,7 @@ export class CdkAppStack extends cdk.Stack {
 
 
     const rule = new events.Rule(this, 'EcsScheduledRule', {
-      schedule: events.Schedule.expression('rate(1 minute)'),
+      schedule: events.Schedule.expression('rate(10 minute)'),
     });
 
 
@@ -52,15 +52,24 @@ export class CdkAppStack extends cdk.Stack {
       // ]
     })
 
+    const checkErrorLambda = new tasks.LambdaInvoke(this, 'CheckError', {
+      lambdaFunction: this.createCheckError(),
+      outputPath: '$.taskError',
+      payloadResponseOnly: true
+    })
+
+
     const retry = runTask.addRetry({
       errors: ['ECS.AccessDeniedException'],
       interval: cdk.Duration.seconds(60),
-      maxAttempts: 2,
-      backoffRate: 2
+      // maxAttempts: 2,
+      // backoffRate: 2
     })
 
+    const lambda = this.createLambdaNotifyFailure();
+
     const notifyFailure = new tasks.LambdaInvoke(this, 'NotifyFailure', {
-      lambdaFunction: this.createLambdaNotifyFailure(),
+      lambdaFunction: lambda,
       outputPath: '$.taskError',
       payloadResponseOnly: true
     })
@@ -70,21 +79,55 @@ export class CdkAppStack extends cdk.Stack {
     //   resultPath: '$.taskError'
     // })
 
-    const definition =  runTask
-    .addCatch(notifyFailure, {
-      errors:['States.ALL'],
-      resultPath: '$.taskError',
-    });
+    const definition = stepfunctions.Chain.start(
+      runTask
+        .addCatch(
+          checkErrorLambda.next(
+            new stepfunctions.Choice(this, `Retryable?`)
+              .when(
+                stepfunctions.Condition.and(
+                  stepfunctions.Condition.stringEquals("$.Error.Payload.type", "retryable"),
+                  stepfunctions.Condition.numberLessThan("$.Error.Payload.retryCount", 3),
+                ),
+                new stepfunctions.Wait(this, `RetryWait`, {
+                  time: stepfunctions.WaitTime.secondsPath("$.Error.Payload.waitTimeSeconds"),
+                }).next(runTask),
+              )
+              .otherwise(notifyFailure),
+          ),
+          { resultPath: "$.RunTaskError" },
+        )
+    );
+
+    // const definition =  runTask
+    // .addCatch(notifyFailure, {
+    //   errors:['States.ALL'],
+    //   resultPath: '$.taskError',
+    // });
 
     // const defination = stepfunctions.Chain.start(runTask).next(retry).next(catchAll)
 
     const stepFunctions = new stepfunctions.StateMachine(this, 'TestStateMachineCDK', {
       stateMachineName: 'test-retry',
-      timeout: cdk.Duration.minutes(2),
+      timeout: cdk.Duration.seconds(5),
       definition: definition
     })
 
     rule.addTarget(new targets.SfnStateMachine(stepFunctions));
+
+
+    // CloudWatch Event Rule to monitor Step Function timeouts
+    const eventRule = new events.Rule(this, 'StepFunctionTimeoutRule', {
+      eventPattern: {
+        source: ['aws.states'],
+        detailType: ['Step Functions Execution Status Change'],
+        detail: {
+          status: ['TIMED_OUT']
+        }
+      }
+    });
+
+    eventRule.addTarget(new targets.LambdaFunction(lambda));
   }
 
   createLambdaNotifyFailure() {
@@ -93,7 +136,7 @@ export class CdkAppStack extends cdk.Stack {
     const path = require('path');
 
     const lambdaFunctionName = `lambda-notify-failure-ecs-scheduled-task`;
-    return new lambda.Function(this, `NotifyFailureReTryEcsTaskLambda`, {
+    return new lambda.Function(this, `NotifyFailureReTryEcsTaskLambda1`, {
         runtime: lambda.Runtime.NODEJS_18_X,
         functionName: lambdaFunctionName,
         handler: 'index.handler',
@@ -105,6 +148,24 @@ export class CdkAppStack extends cdk.Stack {
         memorySize: 128,
     });
  }
+
+  createCheckError() {
+
+    const path = require('path');
+
+    const lambdaFunctionName = `check-error`;
+    return new lambda.Function(this, `NotifyFailureReTryEcsTaskLambda`, {
+      runtime: lambda.Runtime.NODEJS_18_X,
+      functionName: lambdaFunctionName,
+      handler: 'index.handler',
+      code: lambda.Code.fromAsset(
+        path.join(__dirname, '..','lib', 'lambda', 'check-error')
+      ),
+      environment: { SLACK_WEBHOOK_URL: 'hook' },
+      timeout: cdk.Duration.minutes(1),
+      memorySize: 128,
+    });
+  }
  
   
 }
